@@ -1,4 +1,5 @@
 // Shared application and document helpers used by the student and staff routes.
+import crypto from 'node:crypto';
 import { NO_TEST } from './criteria.js';
 
 export const STUDY_MODES = ['On campus', 'Online', 'Blended'];
@@ -70,13 +71,13 @@ export function cleanFileName(raw, mimeType) {
   return name || `document${extension}`;
 }
 
-export function sendDocument(res, doc) {
-  res.set({
-    'Content-Type': doc.mime_type,
-    'Content-Length': doc.content.length,
-    'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(doc.file_name)}`,
-    'X-Content-Type-Options': 'nosniff',
-    'Cache-Control': 'private, no-store',
-  });
-  res.send(doc.content);
-}
+const EXTENSIONS = { 'application/pdf': 'pdf', 'image/jpeg': 'jpg', 'image/png': 'png' };
+
+/** A new, unguessable storage path for a file that belongs to an application. */
+export const newStoragePath = (applicationId, mimeType) =>
+  `applications/${applicationId}/${crypto.randomUUID()}.${EXTENSIONS[mimeType]}`;
+
+/** True if path is one this application's upload link could have created. */
+export const isApplicationPath = (applicationId, path) =>
+  typeof path === 'string'
+  && new RegExp(`^applications/${applicationId}/[0-9a-f-]{36}\\.(pdf|jpg|png)$`).test(path);

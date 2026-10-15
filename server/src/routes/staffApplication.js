@@ -6,8 +6,9 @@ import { requireAuth, requireRole } from '../auth.js';
 import { HttpError, audit, changeStage, closeProspect, completeTasks, ensureTask } from '../pipeline.js';
 import { isUuid } from '../validate.js';
 import {
-  OFFER_DAYS, allRequiredVerified, anyPending, currentApplication, documentChecklist, sendDocument,
+  OFFER_DAYS, allRequiredVerified, anyPending, currentApplication, documentChecklist, newStoragePath,
 } from '../application.js';
+import { createDownloadUrl, removeFiles, writeFile } from '../storage.js';
 import { formatLongDate, offerLetterPdf } from '../offerLetter.js';
 import { runDailyJobs } from '../jobs.js';
 import { sendEmail, templates } from '../mailer.js';
@@ -17,11 +18,12 @@ router.use(requireAuth('staff'));
 const wrap = (fn) => (req, res, next) => fn(req, res).catch(next);
 const noteOf = (body) => (typeof body?.note === 'string' ? body.note.trim() : '');
 
+// Returns a short-lived download link for any document.
 router.get('/documents/:id', wrap(async (req, res) => {
   if (!isUuid(req.params.id)) throw new HttpError(404, 'Document not found.');
-  const { rows } = await query('SELECT file_name, mime_type, content FROM document WHERE id = $1', [req.params.id]);
+  const { rows } = await query('SELECT file_name, storage_path FROM document WHERE id = $1', [req.params.id]);
   if (!rows.length) throw new HttpError(404, 'Document not found.');
-  sendDocument(res, rows[0]);
+  res.json({ url: await createDownloadUrl(rows[0].storage_path, rows[0].file_name) });
 }));
 
 // Step 5, staff: verify or reject one uploaded document.
@@ -88,6 +90,7 @@ router.post('/prospects/:id/application-decision', requireRole('recruiter'), wra
   if (!accept && !note) throw new HttpError(422, 'A note is required when rejecting.', { errors: { note: 'Explain why the application is rejected.' } });
   if (note.length > 1000) throw new HttpError(422, 'Note must be 1,000 characters or fewer.');
 
+  let letterPath = null;
   const result = await withTransaction(async (client) => {
     const prospect = (await client.query('SELECT id, full_name, email, address, stage FROM prospect WHERE id = $1 FOR UPDATE', [id])).rows[0];
     if (!prospect) throw new HttpError(404, 'Prospect not found.');
@@ -113,10 +116,13 @@ router.post('/prospects/:id/application-decision', requireRole('recruiter'), wra
         name: prospect.full_name, address: prospect.address, program: details.program, intake: details.intake,
         intakeStart: details.start_date, studyMode: application.study_mode, offerDate: new Date(), expires,
       });
+      // Stored before the transaction commits: if storing fails, nothing changes.
+      letterPath = newStoragePath(application.id, 'application/pdf');
+      await writeFile(letterPath, pdf, 'application/pdf');
       await client.query(
-        `INSERT INTO document (application_id, document_type, issued, file_name, mime_type, size_bytes, content, status, verified_by, verified_at)
+        `INSERT INTO document (application_id, document_type, issued, file_name, mime_type, size_bytes, storage_path, status, verified_by, verified_at)
          VALUES ($1, 'Offer letter', TRUE, 'Offer letter.pdf', 'application/pdf', $2, $3, 'Verified', $4, now())`,
-        [application.id, pdf.length, pdf, req.user.sub],
+        [application.id, pdf.length, letterPath, req.user.sub],
       );
       await client.query(
         `UPDATE application SET status = 'Accepted', decision_by = $2, decision_note = $3, decided_at = now(), offer_expires_at = $4 WHERE id = $1`,
@@ -133,6 +139,9 @@ router.post('/prospects/:id/application-decision', requireRole('recruiter'), wra
     }
     await audit(client, { prospectId: id, actorType: 'staff', actorId: req.user.sub, action: `Application ${accept ? 'accepted' : 'rejected'}`, detail: { note: note || null } });
     return { prospect, program: details.program, expires };
+  }).catch(async (err) => {
+    await removeFiles([letterPath]); // the decision rolled back, so drop the letter too
+    throw err;
   });
 
   const data = { name: result.prospect.full_name, program: result.program };

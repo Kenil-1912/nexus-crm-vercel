@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import bcrypt from 'bcryptjs';
 import { pool } from '../src/db.js';
+import { prepareBucket } from '../src/storage.js';
 
 const schema = fs.readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
 await pool.query(schema);
@@ -39,5 +40,7 @@ for (const [name, discipline, level, lang] of programs) {
   );
 }
 
+const storage = await prepareBucket({ empty: true });
+console.log(`File storage: ${storage === 'supabase' ? 'Supabase Storage (bucket emptied)' : 'local database table'}`);
 console.log('Database reset. Staff logins: sarah@ric.test, michael@ric.test, manager@ric.test / Password123!');
 await pool.end();

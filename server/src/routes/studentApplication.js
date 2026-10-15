@@ -1,14 +1,15 @@
 // Student portal, steps 5 to 7: application form, document upload, offer, enrolment, withdrawal.
 // Every query is scoped to the logged-in student's own prospect record.
-import express, { Router } from 'express';
+import { Router } from 'express';
 import { query, withTransaction } from '../db.js';
 import { requireAuth } from '../auth.js';
 import { HttpError, audit, changeStage, closeProspect, createTask, ensureTask } from '../pipeline.js';
 import { isUuid, validateApplication } from '../validate.js';
 import {
   FILE_TYPES, MAX_FILE_BYTES, STUDY_MODES, cleanFileName, contentMatchesType, currentApplication,
-  documentChecklist, missingDocuments, sendDocument,
+  documentChecklist, isApplicationPath, missingDocuments, newStoragePath,
 } from '../application.js';
+import { createDownloadUrl, createUploadTarget, readFile, removeFiles } from '../storage.js';
 import { sendEmail, templates } from '../mailer.js';
 
 const router = Router();
@@ -88,63 +89,98 @@ router.put('/application', wrap(async (req, res) => {
   res.json({ message: 'Draft saved.' });
 }));
 
-// Upload one document. The file is the request body; its type comes from the
-// Content-Type header and its name from X-File-Name.
-router.put(
-  '/application/documents',
-  express.raw({ type: FILE_TYPES, limit: MAX_FILE_BYTES }),
-  wrap(async (req, res) => {
-    const documentType = typeof req.query.type === 'string' ? req.query.type : '';
-    const mimeType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-    if (!FILE_TYPES.includes(mimeType) || !Buffer.isBuffer(req.body)) {
-      throw new HttpError(415, 'Upload a PDF, JPG or PNG file.');
+// Uploading a document takes three requests, so the file goes straight to
+// storage and never through the API (Vercel limits a request to about 4.5 MB):
+//   1. POST /application/documents/upload-url  -> where to send the file
+//   2. the browser PUTs the file to that address
+//   3. POST /application/documents             -> the API checks the stored file and records it
+
+/** Can this student change this document right now? Returns what the checks found. */
+async function documentSlot(client, userId, documentType) {
+  const prospect = await loadProspect(client, userId, { lock: true });
+  const application = await currentApplication(client, prospect.id, { lock: true });
+  if (!application) throw new HttpError(409, 'There is no application to add documents to.');
+
+  const entry = (await documentChecklist(client, application)).find((c) => c.document_type === documentType);
+  if (!entry) throw new HttpError(422, 'That document is not on your checklist.');
+
+  const drafting = prospect.stage === 'Qualified' && application.status === 'Draft';
+  const replacingRejected = prospect.stage === 'Application' && entry.document?.status === 'Rejected';
+  if (!drafting && !replacingRejected) throw new HttpError(409, 'This document can no longer be changed.');
+  return { prospect, application, entry, replacingRejected };
+}
+
+const typeOf = (body) => (typeof body?.document_type === 'string' ? body.document_type : '');
+
+router.post('/application/documents/upload-url', wrap(async (req, res) => {
+  const mimeType = typeof req.body?.mime_type === 'string' ? req.body.mime_type.toLowerCase() : '';
+  const size = Number(req.body?.size_bytes);
+  if (!FILE_TYPES.includes(mimeType)) throw new HttpError(415, 'Upload a PDF, JPG or PNG file.');
+  if (!Number.isFinite(size) || size <= 0) throw new HttpError(422, 'The file is empty.');
+  if (size > MAX_FILE_BYTES) throw new HttpError(413, 'That file is too large. The limit is 10 MB.');
+
+  const { application } = await withTransaction((client) => documentSlot(client, req.user.sub, typeOf(req.body)));
+  const path = newStoragePath(application.id, mimeType);
+  res.json({ path, ...(await createUploadTarget(path, mimeType)) });
+}));
+
+router.post('/application/documents', wrap(async (req, res) => {
+  const documentType = typeOf(req.body);
+  const path = req.body?.path;
+  const mimeType = typeof req.body?.mime_type === 'string' ? req.body.mime_type.toLowerCase() : '';
+  if (!FILE_TYPES.includes(mimeType)) throw new HttpError(415, 'Upload a PDF, JPG or PNG file.');
+  const fileName = cleanFileName(req.body?.file_name, mimeType);
+
+  // Check the file itself before recording it. A bad file is deleted again.
+  const owner = await loadProspect({ query }, req.user.sub);
+  const application = await currentApplication({ query }, owner.id);
+  if (!application || !isApplicationPath(application.id, path)) throw new HttpError(422, 'That upload is not part of your application.');
+  const file = await readFile(path);
+  if (!file) throw new HttpError(422, 'The upload did not finish. Please try again.');
+  const problem = file.length === 0 ? 'The file is empty.'
+    : file.length > MAX_FILE_BYTES ? 'That file is too large. The limit is 10 MB.'
+      : !contentMatchesType(file, mimeType) ? 'This file does not look like a real PDF, JPG or PNG. Export it again and retry.'
+        : null;
+  if (problem) {
+    await removeFiles([path]);
+    throw new HttpError(422, problem);
+  }
+
+  let replaced = null;
+  await withTransaction(async (client) => {
+    const { prospect, application: current, entry, replacingRejected } = await documentSlot(client, req.user.sub, documentType);
+    if (current.id !== application.id) throw new HttpError(409, 'Your application changed. Please try again.');
+    if ((await client.query('SELECT 1 FROM document WHERE storage_path = $1', [path])).rows.length) {
+      throw new HttpError(409, 'This upload has already been recorded.');
     }
-    if (req.body.length === 0) throw new HttpError(422, 'The file is empty.');
-    if (!contentMatchesType(req.body, mimeType)) {
-      throw new HttpError(422, 'This file does not look like a real PDF, JPG or PNG. Export it again and retry.');
+    if (entry.document) {
+      replaced = (await client.query('DELETE FROM document WHERE id = $1 RETURNING storage_path', [entry.document.id])).rows[0].storage_path;
     }
-    const fileName = cleanFileName(req.headers['x-file-name'], mimeType);
+    await client.query(
+      `INSERT INTO document (application_id, document_type, file_name, mime_type, size_bytes, storage_path)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [current.id, documentType, fileName, mimeType, file.length, path],
+    );
+    await audit(client, { prospectId: prospect.id, actorType: 'student', actorId: req.user.sub, action: 'Document uploaded', detail: { document_type: documentType, file_name: fileName } });
+    if (replacingRejected) {
+      await ensureTask(client, { prospectId: prospect.id, staffId: prospect.assigned_staff_id, type: 'Verify documents', workingDays: 3 });
+    }
+  });
+  await removeFiles([replaced]);
+  res.status(201).json({ message: 'Uploaded.' });
+}));
 
-    await withTransaction(async (client) => {
-      const prospect = await loadProspect(client, req.user.sub, { lock: true });
-      const application = await currentApplication(client, prospect.id, { lock: true });
-      if (!application) throw new HttpError(409, 'There is no application to add documents to.');
-
-      const entry = (await documentChecklist(client, application)).find((c) => c.document_type === documentType);
-      if (!entry) throw new HttpError(422, 'That document is not on your checklist.');
-
-      const drafting = prospect.stage === 'Qualified' && application.status === 'Draft';
-      const replacingRejected = prospect.stage === 'Application' && entry.document?.status === 'Rejected';
-      if (!drafting && !replacingRejected) {
-        throw new HttpError(409, 'This document can no longer be changed.');
-      }
-
-      if (entry.document) await client.query('DELETE FROM document WHERE id = $1', [entry.document.id]);
-      await client.query(
-        `INSERT INTO document (application_id, document_type, file_name, mime_type, size_bytes, content)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [application.id, documentType, fileName, mimeType, req.body.length, req.body],
-      );
-      await audit(client, { prospectId: prospect.id, actorType: 'student', actorId: req.user.sub, action: 'Document uploaded', detail: { document_type: documentType, file_name: fileName } });
-      if (replacingRejected) {
-        await ensureTask(client, { prospectId: prospect.id, staffId: prospect.assigned_staff_id, type: 'Verify documents', workingDays: 3 });
-      }
-    });
-    res.status(201).json({ message: 'Uploaded.' });
-  }),
-);
-
-// Download one of the student's own documents (uploads or the offer letter).
+// A short-lived download link for one of the student's own documents (uploads or the offer letter).
 router.get('/documents/:id', wrap(async (req, res) => {
   if (!isUuid(req.params.id)) throw new HttpError(404, 'Document not found.');
   const { rows } = await query(
-    `SELECT d.file_name, d.mime_type, d.content FROM document d
+    `SELECT d.file_name, d.storage_path FROM document d
      JOIN application a ON a.id = d.application_id JOIN prospect p ON p.id = a.prospect_id
      WHERE d.id = $1 AND p.user_id = $2`,
     [req.params.id, req.user.sub],
   );
   if (!rows.length) throw new HttpError(404, 'Document not found.');
-  sendDocument(res, rows[0]);
+  res.json({ url: await createDownloadUrl(rows[0].storage_path, rows[0].file_name) });
 }));
 
 // Step 5: submit the application.

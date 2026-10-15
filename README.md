@@ -18,30 +18,81 @@ Around that flow:
 
 ## Stack
 
-- `server/` – Node.js, Express, PostgreSQL (`pg`), JWT logins
-- `client/` – React (Vite), React Router
+- `client/` – React (Vite), React Router. On Vercel: static site.
+- `server/` – Node.js, Express, PostgreSQL (`pg`), JWT logins. On Vercel: one serverless function (`api/index.js`).
+- **Supabase** – the PostgreSQL database, and Storage for uploaded documents and offer letters.
+
+This is the Vercel and Supabase version of the original `nexus-crm` project. The screens and business rules are the same; what changed:
+
+| Area | Original | This version |
+| --- | --- | --- |
+| Hosting | Run on your own machine | Vercel (front end and API in one project) |
+| Database | Local PostgreSQL | Supabase PostgreSQL (local PostgreSQL still works) |
+| Uploaded files | Inside the database, sent through the API | Supabase Storage. The browser uploads straight to storage, because Vercel limits a request to about 4.5 MB |
+| Reminder checks | Timer inside the API, every 6 hours | Vercel Cron calls `/api/cron/daily-jobs` once a day |
+
+Without Supabase settings, files are kept in a `local_file` database table instead, so the project still runs and tests on a laptop with plain PostgreSQL.
+
+## Deploy to Vercel and Supabase
+
+**1. Supabase**
+
+1. Create a project at supabase.com. Note the database password you choose.
+2. **Project Settings → API**: copy the **Project URL** and the **service_role** key. The service role key is secret: put it only in Vercel and your `server/.env`, never in the front end or GitHub.
+3. **Project Settings → Database → Connection string**: copy two strings:
+   - **Transaction pooler** (port 6543), for Vercel
+   - **Session pooler** (port 5432), for running `db:reset` from your computer
+
+**2. Create the tables (from your computer, once)**
+
+In `server/.env` set `DATABASE_URL` to the session pooler string (with your password in it), `DATABASE_SSL=true`, `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. Then:
+
+```bash
+npm install
+npm run db:reset      # creates the tables, demo data and the private "documents" bucket
+```
+
+**3. Vercel**
+
+1. At vercel.com, **Add New → Project** and import this GitHub repository. Leave the root directory as the repository root; `vercel.json` sets the build.
+2. Before deploying, add these **Environment Variables**:
+
+| Name | Value |
+| --- | --- |
+| `DATABASE_URL` | the **transaction pooler** string |
+| `DATABASE_SSL` | `true` |
+| `PG_POOL_MAX` | `2` |
+| `SUPABASE_URL` | the Project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | the service role key |
+| `JWT_SECRET` | a long random string |
+| `CRON_SECRET` | another long random string |
+| `APP_URL` | your Vercel address, for example `https://nexus-crm-vercel.vercel.app` |
+
+3. Deploy. Open the address and send an enquiry to check it works.
+4. If the address differs from `APP_URL`, update `APP_URL` and redeploy, so links in emails are right.
+
+Every push to `main` deploys again automatically.
+
+**Checks after deploying:** `https://<your-address>/api/health` shows `{"ok":true}`; an uploaded document appears in Supabase under **Storage → documents**; the cron job is listed under the project's **Settings → Cron Jobs**.
 
 ## Run it locally
 
-You need Node.js 20+ and PostgreSQL 14+.
+You need Node.js 20+ and either a Supabase project (above) or local PostgreSQL 14+.
 
 ```bash
-# 1. Database (once)
+# Local PostgreSQL only (once):
 psql -U postgres -c "CREATE USER nexus WITH PASSWORD 'nexus' CREATEDB;"
 psql -U postgres -c "CREATE DATABASE nexus_crm OWNER nexus;"
 
-# 2. API
-cd server
-cp .env.example .env        # set JWT_SECRET to a long random string
-npm install
-npm run db:reset            # creates tables and demo data (wipes existing data)
-npm run dev                 # http://localhost:4000
-
-# 3. Front end (second terminal)
-cd client
-npm install
-npm run dev                 # http://localhost:5173
+# From the repository root:
+cp server/.env.example server/.env   # then edit it
+npm install                          # installs both server and client
+npm run db:reset                     # creates tables and demo data (wipes existing data)
+npm run dev:server                   # API on http://localhost:4000
+npm run dev:client                   # second terminal: app on http://localhost:5173
 ```
+
+Locally the reminder checks still run every 6 hours inside the API.
 
 ## Demo logins
 
@@ -71,9 +122,10 @@ Because the account is created without an emailed link, the email address is not
 ## Tests
 
 ```bash
-cd server
-npm test        # resets the database, then runs the end-to-end API tests
+npm test        # from the root: resets the database, then runs the 29 API tests
 ```
+
+Run the tests against a local or test database, never the live one: they wipe it.
 
 ## Where things are
 
@@ -86,15 +138,20 @@ npm test        # resets the database, then runs the end-to-end API tests
 | `server/src/mailer.js` | Email templates and sending |
 | `server/src/application.js` | Document checklist, file checks, download |
 | `server/src/offerLetter.js` | Offer letter PDF |
+| `server/src/storage.js` | File storage: Supabase Storage, or the local table |
+| `server/src/routes/system.js` | Local file upload and download links, and the cron endpoint |
+| `api/index.js`, `vercel.json` | Vercel entry point, routing, cron schedule |
 | `server/src/jobs.js` | Reminder, auto-close and escalation rules, with their day limits in `RULES` |
 | `server/src/routes/` | `public.js` (enquiry, sign-up, login), `student.js`, `studentApplication.js`, `staff.js`, `staffApplication.js` (includes reports) |
 | `client/src/pages/` | One file per screen |
 
 ## Good to know
 
-- Uploaded files and offer letters are stored in the database (`document.content`), up to 10 MB each. For heavy use, move them to file or object storage.
-- The reminder checks run 30 seconds after the API starts and every 6 hours. `npm run jobs` in `server/` runs them once.
+- Files are in a private bucket. Downloads go through the API, which checks who is asking and returns a link that works for 60 seconds.
+- After a file is uploaded, the API reads it back and checks that it really is a PDF, JPG or PNG under 10 MB; anything else is deleted.
+- Vercel's free plan runs cron jobs about once a day, so reminders go out daily (20:00 UTC, which is early morning in Sydney). Managers can also run them from the Reports page.
 - Timings: details reminder after 3 days and close after 14; application reminder after 7 days and close after 30; rejected-document reminder after 5 days and close after 21; offers last 14 days with a reminder 7 days before; tasks escalate 2 working days after their due date.
+- The database connection uses SSL without checking the certificate against a CA. For production, download Supabase's CA certificate and pass it in `server/src/db.js`.
 
 ## Not built yet
 

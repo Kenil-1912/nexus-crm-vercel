@@ -3,7 +3,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { query } from '../src/db.js';
 import { runDailyJobs } from '../src/jobs.js';
-import { api, applied, emailsTo, enquire, offered, qualified, stageOf, staffLogin, start, stop } from './helpers.js';
+import { ctx, api, applied, emailsTo, enquire, offered, qualified, stageOf, staffLogin, start, stop } from './helpers.js';
 
 const inDays = (n) => new Date(Date.now() + n * 864e5);
 const count = (list, item) => list.filter((x) => x === item).length;
@@ -64,4 +64,16 @@ test('records are closed with the right reason when the time runs out', async ()
   assert.equal(live, 0);
   assert.equal((await query(`SELECT count(*)::int AS n FROM task WHERE status = 'Open'`)).rows[0].n, 0);
   assert.deepEqual(await runDailyJobs(inDays(60)), { reminders: 0, closed: 0, escalated: 0 });
+});
+
+test('cron endpoint: needs the CRON_SECRET bearer token', async () => {
+  const call = (auth) => fetch(`${ctx.base}/api/cron/daily-jobs`, { headers: auth ? { Authorization: auth } : {} });
+  delete process.env.CRON_SECRET;
+  assert.equal((await call('Bearer anything')).status, 401); // no secret configured: always refused
+  process.env.CRON_SECRET = 'test-cron-secret';
+  assert.equal((await call()).status, 401);
+  assert.equal((await call('Bearer wrong')).status, 401);
+  const ok = await call('Bearer test-cron-secret');
+  assert.equal(ok.status, 200);
+  assert.deepEqual(Object.keys(await ok.json()).sort(), ['closed', 'escalated', 'reminders']);
 });

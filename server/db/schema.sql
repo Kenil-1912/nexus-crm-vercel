@@ -1,7 +1,7 @@
 -- Nexus CRM schema (enquiry -> enrolment)
 -- Safe to re-run: drops and recreates everything.
 
-DROP TABLE IF EXISTS email_log, task, audit_log, stage_history, enrolment, document,
+DROP TABLE IF EXISTS local_file, email_log, task, audit_log, stage_history, enrolment, document,
   program_document_type, application,
   qualification, signup_token, enquiry, prospect, student_user, intake,
   program, staff_user CASCADE;
@@ -135,8 +135,8 @@ CREATE TABLE program_document_type (
   UNIQUE (program_id, document_type)
 );
 
--- Uploaded files and issued letters. File content is kept in the database so
--- a document and its record can never get out of step.
+-- Uploaded files and issued letters. The file itself is in storage (Supabase
+-- Storage, or local_file when running locally); storage_path points to it.
 CREATE TABLE document (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   application_id   UUID NOT NULL REFERENCES application(id),
@@ -145,7 +145,7 @@ CREATE TABLE document (
   file_name        TEXT NOT NULL,
   mime_type        TEXT NOT NULL CHECK (mime_type IN ('application/pdf', 'image/jpeg', 'image/png')),
   size_bytes       INT NOT NULL,
-  content          BYTEA NOT NULL,
+  storage_path     TEXT NOT NULL UNIQUE,
   status           TEXT NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Verified', 'Rejected')),
   rejection_reason TEXT,
   uploaded_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -207,4 +207,12 @@ CREATE TABLE email_log (
   body        TEXT NOT NULL,
   status      TEXT NOT NULL CHECK (status IN ('Sent', 'Logged', 'Failed')),
   sent_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Stand-in for Supabase Storage when running locally without Supabase.
+CREATE TABLE local_file (
+  path       TEXT PRIMARY KEY,
+  mime_type  TEXT NOT NULL,
+  content    BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

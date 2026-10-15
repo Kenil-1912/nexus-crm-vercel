@@ -3,7 +3,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { query } from '../src/db.js';
 import {
-  DOC_TYPES, PDF, PNG, api, applied, details, download, emailsTo, enquire, offered, qualified, stageOf, staffLogin,
+  ctx, DOC_TYPES, PDF, PNG, api, applied, details, download, emailsTo, enquire, offered, qualified, stageOf, staffLogin,
   start, stop, upload, verifyAll, prospectId,
 } from './helpers.js';
 
@@ -32,22 +32,34 @@ test('application: draft, upload rules, and submit needs every field and documen
   assert.equal((await upload(token, DOC_TYPES[0], { mime: 'text/plain', bytes: Buffer.from('hello') })).status, 415);
   assert.equal((await upload(token, DOC_TYPES[0], { bytes: Buffer.from('not really a pdf') })).status, 422);
   assert.equal((await upload(token, 'Bank statement')).status, 422);
-  assert.equal((await upload(token, DOC_TYPES[0], { bytes: Buffer.concat([PDF, Buffer.alloc(10 * 1024 * 1024)]) })).status, 413);
+  assert.equal((await upload(token, DOC_TYPES[0], { size: 11 * 1024 * 1024 })).status, 413); // declared too big
+  assert.equal((await upload(token, DOC_TYPES[0], { bytes: Buffer.concat([PDF, Buffer.alloc(10 * 1024 * 1024)]), size: 100 })).status, 413); // sent too big
+  assert.equal((await query('SELECT count(*)::int AS n FROM local_file')).rows[0].n, 0); // the rejected fake PDF was deleted
   assert.equal((await upload(token, DOC_TYPES[0], { name: '../../etc/pass<wd>.pdf' })).status, 201);
   assert.equal((await upload(token, DOC_TYPES[0], { mime: 'image/png', bytes: PNG, name: 'passport.png' })).status, 201); // replaces
   const one = await api('GET', '/api/student/application', null, token);
   const passport = one.body.checklist.find((c) => c.document_type === DOC_TYPES[0]).document;
   assert.equal(passport.file_name, 'passport.png');
   assert.equal((await query('SELECT count(*)::int AS n FROM document')).rows[0].n, 1);
+  assert.equal((await query('SELECT count(*)::int AS n FROM local_file')).rows[0].n, 1); // replaced file deleted
+
+  // A confirmed upload cannot be recorded twice, and another application's path is refused.
+  const link = await api('POST', '/api/student/application/documents/upload-url', { document_type: DOC_TYPES[1], mime_type: 'application/pdf', size_bytes: PDF.length }, token);
+  await fetch(new URL(link.body.url, ctx.base), { method: 'PUT', headers: link.body.headers, body: PDF });
+  const confirm = { document_type: DOC_TYPES[1], path: link.body.path, mime_type: 'application/pdf', file_name: 'a.pdf' };
+  assert.equal((await api('POST', '/api/student/application/documents', confirm, token)).status, 201);
+  assert.equal((await api('POST', '/api/student/application/documents', confirm, token)).status, 409);
+  assert.equal((await api('POST', '/api/student/application/documents', { ...confirm, path: 'applications/00000000-0000-0000-0000-000000000000/11111111-1111-1111-1111-111111111111.pdf' }, token)).status, 422);
+  const expired = link.body.url.replace(/upload\/[^/]+$/, 'upload/not-a-token');
+  assert.equal((await fetch(new URL(expired, ctx.base), { method: 'PUT', headers: link.body.headers, body: PDF })).status, 403);
 
   // Submit: missing fields, then missing documents
   assert.ok((await api('POST', '/api/student/application/submit', { intake_id: intakeId }, token)).body.errors.date_of_birth);
   const missing = await api('POST', '/api/student/application/submit', details(intakeId), token);
   assert.equal(missing.status, 422);
-  assert.match(missing.body.errors.documents, /Academic transcript, English test result/);
+  assert.match(missing.body.errors.documents, /missing documents: English test result\./);
   assert.equal((await stageOf('apply@example.com')).stage, 'Qualified');
 
-  await upload(token, DOC_TYPES[1]);
   await upload(token, DOC_TYPES[2]);
   assert.deepEqual((await api('POST', '/api/student/application/submit', details(intakeId), token)).body, { stage: 'Application' });
   assert.equal((await upload(token, DOC_TYPES[1])).status, 409); // locked once submitted

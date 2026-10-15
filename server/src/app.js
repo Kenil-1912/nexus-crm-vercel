@@ -5,6 +5,7 @@ import studentRoutes from './routes/student.js';
 import staffRoutes from './routes/staff.js';
 import studentApplicationRoutes from './routes/studentApplication.js';
 import staffApplicationRoutes from './routes/staffApplication.js';
+import systemRoutes from './routes/system.js';
 
 export function createApp() {
   const app = express();
@@ -12,6 +13,7 @@ export function createApp() {
   app.use(express.json({ limit: '50kb' }));
 
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
+  app.use('/api', systemRoutes);
   app.use('/api/student', studentRoutes);
   app.use('/api/student', studentApplicationRoutes);
   app.use('/api/staff', staffRoutes);

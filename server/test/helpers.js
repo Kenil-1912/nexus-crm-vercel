@@ -32,17 +32,21 @@ export const PDF = Buffer.from('%PDF-1.4\n% test file\n');
 export const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('png body')]);
 export const DOC_TYPES = ['Passport or photo ID', 'Academic transcript', 'English test result'];
 
-export async function upload(token, type, { mime = 'application/pdf', bytes = PDF, name = 'file.pdf' } = {}) {
-  const res = await fetch(`${ctx.base}/api/student/application/documents?type=${encodeURIComponent(type)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': mime, 'X-File-Name': encodeURIComponent(name), Authorization: `Bearer ${token}` },
-    body: bytes,
-  });
-  return { status: res.status, body: await res.json() };
+/** The browser's three-step upload: ask for a link, send the file, confirm. */
+export async function upload(token, type, { mime = 'application/pdf', bytes = PDF, name = 'file.pdf', size } = {}) {
+  const link = await api('POST', '/api/student/application/documents/upload-url',
+    { document_type: type, mime_type: mime, size_bytes: size ?? bytes.length }, token);
+  if (link.status !== 200) return link;
+  const put = await fetch(new URL(link.body.url, ctx.base), { method: 'PUT', headers: link.body.headers, body: bytes });
+  if (!put.ok) return { status: put.status, body: await put.json() };
+  return api('POST', '/api/student/application/documents', { document_type: type, path: link.body.path, mime_type: mime, file_name: name }, token);
 }
 
+/** Ask the API for a download link, then follow it. */
 export async function download(path, token) {
-  const res = await fetch(ctx.base + path, { headers: { Authorization: `Bearer ${token}` } });
+  const link = await api('GET', path, null, token);
+  if (link.status !== 200) return { status: link.status };
+  const res = await fetch(new URL(link.body.url, ctx.base));
   return { status: res.status, type: res.headers.get('content-type'), bytes: Buffer.from(await res.arrayBuffer()) };
 }
 
