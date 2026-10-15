@@ -77,7 +77,7 @@ Every push to `main` deploys again automatically.
 
 ## Run it locally
 
-You need Node.js 20+ and either a Supabase project (above) or local PostgreSQL 14+.
+You need Node.js 22 or newer and either a Supabase project (above) or local PostgreSQL 14+.
 
 ```bash
 # Local PostgreSQL only (once):
